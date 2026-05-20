@@ -657,7 +657,7 @@ Route Service, калькулятор доставки и предварител
 **Алгоритм:**
 1. Order Service создает заказ в статусе PENDING.
 2. Payment Service списывает оплату и публикует событие об успешном платеже.
-3. Delivery Service пытается зарезервировать слот доставки или ПВЗ.
+3. Route Service и PVZ Service подтверждают маршрут и выбранный ПВЗ.
 4. Если все прошло успешно, saga завершает процесс и подтверждает заказ.
 5. Если какая-то операция зафейлилась, запускаются серия транзакций ревертов: заказ отменяется, а Payment Service делает возврат или переводит платеж в статус возврата.
 
@@ -667,12 +667,23 @@ Route Service, калькулятор доставки и предварител
 ### 3. Graceful degradation
 
 **Алгоритм:**  
-Недоступен PVZ Service, деградирует поиск или временно медленно отвечает Route Service.
+Недоступен один из некритичных сервисов: PVZ, Route, Price, File или Notification.
 
 **Как это работает:**
 1. В личном кабинете остаются доступны логин, список заказов и трекинг.
 2. Поиск ПВЗ отдается из кеша или показывается последнее успешное значение.
 3. Калькулятор доставки может вернуть сообщение "расчет временно недоступен", не ломая другие страницы.
+4. Если сервис файлов недоступен, заказ создается без фото, а загрузка повторяется позже.
+5. Если уведомления недоступны, события остаются в Kafka и отправляются позже воркером.
+
+| Некритичный сервис       | Что делаем при отказе                                                             |
+|:-------------------------|:----------------------------------------------------------------------------------|
+| **PVZ Service**          | Показываем кеш ПВЗ из Redis. Если кеша нет, просим повторить позже.               |
+| **Route Service**        | Показываем примерный срок доставки или сообщение, что расчет временно недоступен. |
+| **Price Service**        | Показываем старую цену из кеша или блокируем только оформление нового заказа.     |
+| **File Service**         | Разрешаем создать заказ без файлов, загрузку фото и документов повторяем позже.   |
+| **Notification Service** | Не блокируем заказ. Уведомление отправляется позже из Kafka.                      |
+| **ClickHouse**           | Показываем текущий статус из бд, но без полной истории перемещений.               |
 
 **Что это дает:**  
 Сервис деградирует частично, а не целиком.
@@ -695,37 +706,71 @@ graph TD
   L7M --> GW[Web/API Gateway]
   L7S --> GW
 
-  GW --> Auth[Auth/Profile
-  Service]
-  GW --> Order[Order/Payment Service]
+  GW --> Auth[Auth Service]
+  GW --> Profile[Profile Service]
+  GW --> Order[Order Service]
+  GW --> Payment[Payment Service]
   GW --> Track[Tracking Service]
-  GW --> PVZ[PVZ/Route/Prices 
-  Service]
+  GW --> PVZ[PVZ Service]
+  GW --> Route[Route Service]
+  GW --> Price[Price Service]
   GW --> File[File Service]
 
   Auth --> Redis[(Redis)]
   Auth --> PG[(PostgreSQL)]
+  Profile --> PG
   Order --> PG
+  Order --> Profile
+  Order --> PVZ
+  Order --> Route
+  Order --> Price
+  Order --> Payment
+  Payment --> PG
+  Payment --> PSP[Payment API]
   Order --> CH
   Track --> PG
   Track --> CH[(ClickHouse)]
+  Track --> Order
   PVZ --> PG
   PVZ --> Redis
+  Route --> PG
+  Route --> Redis
+  Price --> PG
+  Price --> Redis
   File --> S3[(S3 / MinIO)]
+  File --> PG
 
-  Order -. события .-> Kafka[Kafka]
-  Track -. события .-> Kafka
-  Kafka --> Notify[Notification / Retry Worker]
-  Order --> PSP[Payment API]
-  Notify --> Push[Push / Email]
+  Order --> Outbox[(Outbox table)]
+  Payment --> Outbox
+  Track --> Outbox
+  Outbox --> OutboxProcessor[Outbox Processor]
+
+  subgraph KafkaBox[Kafka]
+    KOrder[order events topic]
+    KPayment[payment events topic]
+    KTrack[tracking events topic]
+    KNotify[notification commands topic]
+  end
+
+  OutboxProcessor -. publish .-> KOrder
+  OutboxProcessor -. publish .-> KPayment
+  OutboxProcessor -. publish .-> KTrack
+
+  KOrder -. consume .-> NotifyWorker[Notification Worker]
+  KPayment -. consume .-> NotifyWorker
+  KTrack -. consume .-> NotifyWorker
+  NotifyWorker -. publish .-> KNotify
+  KNotify -. consume .-> PushWorker[Push/Email Worker]
 ```
 
 ## Пояснения к схеме
 
 * Внешняя балансировка: между двумя ДЦ используем DNS Round-Robin с health-check. Если один ДЦ недоступен, его IP убирается из выдачи.
 * Внутренняя балансировка: внутри ДЦ трафик идет через L4 VIP на L7 Nginx, а затем разводится по gateway и микросервисам.
-* Логин, создание заказа, получение списка заказов, трекинг, поиск ПВЗ и оплата идут через HTTP/gRPC в основной сервисный слой через Gateway.
-* Cобытия о заказах, оплатах и смене статусов публикуются в Kafka, после чего расходятся на уведомления и фоновые обработчики.
+* Простая линия на схеме - синхронный вызов по HTTP/gRPC или запрос в БД.
+* Пунктирная линия - асинхронная передача через Kafka.
+* Cобытия о заказах, оплатах и смене статусов публикуются в Kafka через Outbox Worker.
+* Notification Worker и Push/Email Worker обрабатывают фоновые задачи.
 * PostgreSQL хранит структурированные данные, ClickHouse хранит длинную историю статусов, Redis хранит сессии и кеш, MinIO хранит бинарные файлы.
 
 
@@ -737,17 +782,22 @@ graph TD
 
 Для прикидки используем оценку: Java/Spring Boot сервис средней сложности требует порядка 1 CPU на 80-150 RPS
 
-| Сервис                         | Целевая пиковая нагрузка | CPU   | RAM   | Комментарий                            |
-|:-------------------------------|:-------------------------|:------|:------|:---------------------------------------|
-| **API Gateway**                | ~3 000 RPS               | 8 CPU | 8 GB  | принимает весь внешний HTTP-трафик     |
-| **Auth/Profile Service**       | ~300 RPS                 | 4 CPU | 8 GB  | логин, сессии, профиль                 |
-| **Order/Payment Service**      | ~500 RPS                 | 8 CPU | 16 GB | создание заказа, чтение заказа, оплата |
-| **Tracking Service**           | ~575 RPS                 | 8 CPU | 16 GB | самый частый пользовательский сценарий |
-| **PVZ/Route/Prices Service**   | ~590 RPS                 | 8 CPU | 16 GB | поиск ПВЗ, маршрут, тариф              |
-| **File Service**               | ~100 RPS                 | 2 CPU | 4 GB  | метаданные файлов и доступ к S3/MinIO  |
-| **Notification/Retry Workers** | ~100-200 msg/s           | 4 CPU | 8 GB  | фоновые уведомления и повторы          |
+| Сервис                         | Целевая пиковая нагрузка | Уровень нагрузки | CPU   | RAM   | Комментарий                        |
+|:-------------------------------|:-------------------------|:-----------------|:------|:------|:-----------------------------------|
+| **API Gateway**                | ~3 000 RPS               | высокая          | 8 CPU | 8 GB  | принимает весь внешний HTTP-трафик |
+| **Auth Service**               | ~300 RPS                 | средняя          | 4 CPU | 8 GB  | логин и сессии                     |
+| **Profile Service**            | ~300 RPS                 | средняя          | 4 CPU | 8 GB  | данные пользователя                |
+| **Order Service**              | ~500 RPS                 | высокая          | 6 CPU | 12 GB | создание и чтение заказа           |
+| **Payment Service**            | ~120 RPS                 | низкая           | 4 CPU | 8 GB  | платежи и статусы оплат            |
+| **Tracking Service**           | ~575 RPS                 | высокая          | 8 CPU | 16 GB | самый частый пользовательский путь |
+| **PVZ Service**                | ~210 RPS                 | средняя          | 4 CPU | 8 GB  | поиск ПВЗ                          |
+| **Route Service**              | ~230 RPS                 | средняя          | 4 CPU | 8 GB  | расчет маршрута                    |
+| **Price Service**              | ~150 RPS                 | средняя          | 4 CPU | 8 GB  | расчет стоимости                   |
+| **File Service**               | ~100 RPS                 | низкая           | 2 CPU | 4 GB  | метаданные файлов и доступ к MinIO |
+| **Notification Workers**       | ~100-200 msg/s           | низкая           | 2 CPU | 4 GB  | отправка уведомлений               |
+| **Outbox/Retry Workers**       | ~100-200 msg/s           | низкая           | 4 CPU | 8 GB  | публикация событий и повторы       |
 
-Суммарно требуется около 42 CPU и 76 GB RAM без учета запаса. Для схемы без оркестрации распределяем сервисы по отдельным пулам виртуальных машин и оставляем резерв по N+1.
+Суммарно требуется около 54 CPU и 100 GB RAM без учета запаса. Для схемы без оркестрации распределяем сервисы по отдельным пулам виртуальных машин и оставляем резерв по N+1.
 
 ## Выбор модели развертывания
 
@@ -762,26 +812,39 @@ graph TD
 Для оценки стоимости берем грубые порядки цен:
 
 * цены ориентировочные и приведены диапазонами;
-* ориентир по покупке серверов берем по публичным ценам ServerMall, ориентир по аренде по публичным прайсам и документации Selectel.
+* ориентир по покупке серверов берем по публичным ценам ServerFlow, ориентир по аренде по публичным прайсам и документации Selectel.
 
-| Роль / пул               | Конфигурация одного сервера              | Кол-во  | Размещение      | Что размещаем                                               | Покупка за 1 сервер  | Аренда за 1 сервер в месяц  |
-|:-------------------------|:-----------------------------------------|:--------|:----------------|:------------------------------------------------------------|:---------------------|:----------------------------|
-| **L4 балансировщики**    | 4 CPU, 8 GB RAM, 2x10GbE                 | 4       | 2 Москва, 2 СПб | LVS + Keepalived                                            | 100 000-150 000 RUB  | 4 000-8 000 RUB             |
-| **L7 балансировщики**    | 8 CPU, 16 GB RAM, 2x10GbE                | 4       | 2 Москва, 2 СПб | Nginx                                                       | 150 000-220 000 RUB  | 6 000-12 000 RUB            |
-| **App general**          | 16 CPU, 64 GB RAM, 2x960 GB NVMe         | 6       | 3 Москва, 3 СПб | API Gateway, Auth/Profile, File Service                     | 280 000-380 000 RUB  | 12 000-20 000 RUB           |
-| **App core**             | 16 CPU, 64 GB RAM, 2x960 GB NVMe         | 4       | 2 Москва, 2 СПб | Order/Payment, Tracking, PVZ/Route/Prices                   | 280 000-380 000 RUB  | 12 000-20 000 RUB           |
-| **App async**            | 8 CPU, 32 GB RAM, 2x960 GB NVMe          | 2       | 1 Москва, 1 СПб | Notification Worker, Outbox Processor                       | 180 000-260 000 RUB  | 8 000-14 000 RUB            |
-| **PostgreSQL**           | 32 CPU, 128 GB RAM, 2x3.84 TB NVMe       | 3       | 2 Москва, 1 СПб | USER_PROFILE, ORDER, PAYMENT, PVZ, TARIFF_ZONE, FILE_OBJECT | 550 000-750 000 RUB  | 25 000-40 000 RUB           |
-| **ClickHouse**           | 16 CPU, 64 GB RAM, 2x7.68 TB NVMe        | 2       | 1 Москва, 1 СПб | ORDER_EVENT                                                 | 450 000-650 000 RUB  | 20 000-35 000 RUB           |
-| **Redis / Sentinel**     | 8 CPU, 32 GB RAM, 512 GB NVMe            | 3       | 2 Москва, 1 СПб | сессии и кеш                                                | 170 000-240 000 RUB  | 7 000-12 000 RUB            |
-| **Kafka brokers**        | 16 CPU, 64 GB RAM, 2 TB NVMe             | 3       | 2 Москва, 1 СПб | event streaming и очереди                                   | 300 000-420 000 RUB  | 15 000-25 000 RUB           |
-| **MinIO**                | 8 CPU, 32 GB RAM, 8 TB HDD + 512 GB NVMe | 4       | 2 Москва, 2 СПб | фото, документы, наклейки                                   | 350 000-500 000 RUB  | 14 000-24 000 RUB           |
-| **Monitoring / Logging** | 8 CPU, 32 GB RAM, 1 TB NVMe              | 2       | 1 Москва, 1 СПб | Prometheus, Grafana, ElasticSearch, Kibana                  | 200 000-280 000 RUB  | 8 000-15 000 RUB            |
+| Роль / пул               | Конфигурация одного сервера              | Кол-во  | Размещение      | Что размещаем                                               | Покупка за 1 сервер | Аренда за 1 сервер в месяц |
+|:-------------------------|:-----------------------------------------|:--------|:----------------|:------------------------------------------------------------|:--------------------|:---------------------------|
+| **L4 балансировщики**    | 4 CPU, 8 GB RAM, 2x10GbE                 | 4       | 2 Москва, 2 СПб | LVS + Keepalived                                            | 75 000 RUB          | 4 800 RUB                  |
+| **L7 балансировщики**    | 8 CPU, 16 GB RAM, 2x10GbE                | 4       | 2 Москва, 2 СПб | Nginx                                                       | 90 000 RUB          | 9 500 RUB                  |
+| **App general**          | 16 CPU, 64 GB RAM, 2x128 GB NVMe         | 6       | 3 Москва, 3 СПб | API Gateway, Auth, Profile, File                            | 300 000 RUB         | 28 600 RUB                 |
+| **App core**             | 16 CPU, 64 GB RAM, 2x128 GB NVMe         | 6       | 3 Москва, 3 СПб | Order, Payment, Tracking, PVZ, Route, Price                 | 300 000 RUB         | 28 600 RUB                 |
+| **App async**            | 8 CPU, 32 GB RAM, 2x128 GB NVMe          | 2       | 1 Москва, 1 СПб | Notification Worker, Outbox Worker, Retry Worker            | 200 000 RUB         | 13 200 RUB                 |
+| **PostgreSQL**           | 32 CPU, 128 GB RAM, 2x3.84 TB NVMe       | 3       | 2 Москва, 1 СПб | USER_PROFILE, ORDER, PAYMENT, PVZ, TARIFF_ZONE, FILE_OBJECT | 600 000 RUB         | 123 000 RUB                |
+| **ClickHouse**           | 16 CPU, 64 GB RAM, 2x7.68 TB NVMe        | 2       | 1 Москва, 1 СПб | ORDER_EVENT                                                 | 500 000 RUB         | 140 300 RUB                |
+| **Redis / Sentinel**     | 8 CPU, 32 GB RAM, 64 GB NVMe             | 3       | 2 Москва, 1 СПб | сессии и кеш                                                | 150 000 RUB         | 17 600 RUB                 |
+| **Kafka brokers**        | 16 CPU, 64 GB RAM, 2 TB NVMe             | 3       | 2 Москва, 1 СПб | event streaming и очереди                                   | 350 000 RUB         | 45 100 RUB                 |
+| **MinIO**                | 8 CPU, 32 GB RAM, 8 TB HDD + 512 GB NVMe | 4       | 2 Москва, 2 СПб | фото, документы, наклейки                                   | 400 000 RUB         | 78 700 RUB                 |
+| **Monitoring / Logging** | 8 CPU, 32 GB RAM, 1 TB NVMe              | 2       | 1 Москва, 1 СПб | Prometheus, Grafana, ElasticSearch, Kibana                  | 250 000 RUB         | 22 600 RUB                 |
 
 Итоговая оценка:
-* покупка всего железа: порядка 6,5-9,0 млн RUB;
-* аренда всего парка: порядка 270 000-430 000 RUB в месяц;
-* амортизация при покупке на 5 лет: порядка 110 000-150 000 RUB в месяц без учета стоек, сети и поддержки.
-
+* покупка всего железа: **11 060 000 RUB** (цены ориентировочные, нет машинок один в один с требуемым железом, зачастую имеется большой запас по диску) [[ServerFlow]](https://serverflow.ru/catalog/servery);
+* аренда всего парка: **1 624 500 RUB в месяц** [[Selectel]](https://selectel.ru/prices/);
+* амортизация при покупке на 5 лет: **184 333 RUB в месяц** без учета стоек, сети и поддержки.
 
 Такой состав дает запас по схеме N+1 и позволяет независимо масштабировать внешний API, трекинг, поиск ПВЗ и фоновые обработчики без оркестрации.
+
+## Проверка индексов PostgreSQL
+
+Берем расчет индексов из ДЗ 6. Всего индексы PostgreSQL занимают примерно 138 ГБ.
+
+| Данные PostgreSQL                                      | Размер         |
+|:-------------------------------------------------------|:---------------|
+| Таблицы USER_PROFILE, ORDER, PAYMENT, PVZ, FILE_OBJECT | ~1,21 ТБ       |
+| Индексы PostgreSQL                                     | ~0,14 ТБ       |
+| Итого без резерва                                      | ~1,35 ТБ       |
+| Диск PostgreSQL сервера                                | 2x3,84 ТБ NVMe |
+
+Даже если использовать RAID1, полезный объем будет около **3,84 ТБ**.  
+Итого **1,35 ТБ < 3,84 ТБ**, значит таблицы и индексы влезают. Запас остается примерно 2,49 ТБ.
